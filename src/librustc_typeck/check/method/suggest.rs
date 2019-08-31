@@ -12,7 +12,7 @@ use rustc::hir::def_id::{CRATE_DEF_INDEX, LOCAL_CRATE, DefId};
 use rustc::hir::map as hir_map;
 use rustc::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc::traits::Obligation;
-use rustc::ty::{self, Ty, TyCtxt, ToPolyTraitRef, ToPredicate, TypeFoldable};
+use rustc::ty::{self, Ty, TyCtxt, TyKind, ToPolyTraitRef, ToPredicate, TypeFoldable};
 use rustc::ty::print::with_crate_prefix;
 use syntax_pos::{Span, FileName};
 use syntax::ast;
@@ -515,18 +515,80 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
 
+                // If:
+                // - Method name = "as_str"
+                // - Receiver type is &str
+                // Then:
+                // - Suggest removing to_str
+                // - Disable use of lev_candidate
+                let mut suppress_lev_candidate = false; 
+                let method_is_as_str = item_name.as_str() == "as_str" || item_name.as_str() == "as_mut_str";
+                // Decision: Verify that as_str is called with no arguments
+                // Decision: Catch both .as_mut_str() and .as_str()
+                // - TODO: should they both give the same suggestion? What if the underlying str needs
+                //   to become mutable too? Is that a 2nd error?
+                // Decision: Don't also catch String::as_str() form, because it's a whole
+                // other error. But flag this when I submit the PR.
+                // Decision: Don't need to run this check on types that implment AsRef<str>, because
+                // .as_str() is a legit method to call on those types. (E.g., String implments
+                // AsRef<str>.)
+                // 
+                let receiver_type_is_str_ref = match rcvr_ty.sty {
+                    TyKind::Ref(_, tys, _) => match tys.sty {
+                        TyKind::Str => true, // TODO: Simplify nested match
+                        _ => false,
+                    },
+                    _ => false,
+                };
+
+                // Get the name of the one and only arg
+                let arg_name = args.and_then(|a| {
+                    match (a.len(), a.get(0)) {
+                        (1, Some(expr)) => Some(expr),
+                        _ => None,
+                    }
+                });
+
+
+                dbg!(&rcvr_ty.sty);
+                dbg!(receiver_type_is_str_ref);
+                dbg!(method_is_as_str);
+                dbg!(&args); // See what the arguments look like in various circumstances
+                             // This will let us ensure that the arg list is empty
+                dbg!(&arg_name);
+
+                if receiver_type_is_str_ref && method_is_as_str {
+                    if let Some(_arg_name) = arg_name { // TODO: Better arg naming 
+                        // TODO: Adjust span to include the parens after to_str, and the . before
+
+                        err.span_suggestion(
+                            span,
+                            // TODO: Cleanup wording. Add name of item.
+                            // Maybe "It looks like you're trying to convert a value to type &str, but it is already a &str"
+                            &format!("<item> already has type &str, so you do not need to call {}", item_name.as_str()), 
+                            "".to_string(), // suggestion: Replace with nothing
+                            Applicability::MaybeIncorrect
+                        );
+
+                        suppress_lev_candidate = true;                        
+                    }
+                }
+
+                // TODO: Can also use if_chain here, too
                 if let Some(lev_candidate) = lev_candidate {
-                    let def_kind = lev_candidate.def_kind();
-                    err.span_suggestion(
-                        span,
-                        &format!(
-                            "there is {} {} with a similar name",
-                            def_kind.article(),
-                            def_kind.descr(lev_candidate.def_id),
-                        ),
-                        lev_candidate.ident.to_string(),
-                        Applicability::MaybeIncorrect,
-                    );
+                    if !suppress_lev_candidate {
+                        let def_kind = lev_candidate.def_kind();
+                        err.span_suggestion(
+                            span,
+                            &format!(
+                                "there is {} {} with a similar name",
+                                def_kind.article(),
+                                def_kind.descr(lev_candidate.def_id),
+                            ),
+                            lev_candidate.ident.to_string(),
+                            Applicability::MaybeIncorrect,
+                        );
+                    }
                 }
 
                 err.emit();
